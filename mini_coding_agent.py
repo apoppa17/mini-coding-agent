@@ -12,7 +12,7 @@ from pathlib import Path
 from skill_logger import log_event
 
 
-DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
+DOC_NAMES = ("AGENTS.md", "CLAUDE.md", "README.md", "pyproject.toml", "package.json")
 HELP_TEXT = "/help, /memory, /session, /reset, /exit"
 WELCOME_ART = (
     "/\\     /\\\\",

@@ -256,6 +256,7 @@ class MiniAgent:
         self.active_skill = None
         self.skill_trigger = None
         self.skill_tool_calls = []
+        self.skills_used = []
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -468,7 +469,7 @@ class MiniAgent:
             memory["task"] = clip(user_message.strip(), 300)
         self.record({"role": "user", "content": user_message, "created_at": now()})
         log_event(
-            self.root / ".mini-coding-agent" / "skill_events.jsonl",
+            self.skill_log_path(),
             "prompt_received",
             self.session["id"],
             prompt=user_message,
@@ -476,7 +477,7 @@ class MiniAgent:
         candidates, selected, reason = similarity_check(user_message, self.skills, self.skill_threshold)
         self.selected_skill = next((s for s in self.skills if s.name == selected), None)
         log_event(
-            self.root / ".mini-coding-agent" / "skill_events.jsonl",
+            self.skill_log_path(),
             "similarity_check",
             self.session["id"],
             prompt=user_message,
@@ -487,6 +488,7 @@ class MiniAgent:
             depth=self.depth,
         )
         self.skill_tool_calls = []
+        self.skills_used = []
         if self.selected_skill:
             best = candidates[0]
             self.activate_skill(self.selected_skill, best["method"], best["score"])
@@ -502,6 +504,7 @@ class MiniAgent:
                     "skill_completed",
                     self.session["id"],
                     skill=self.active_skill.name,
+                    skills_used=self.skills_used,
                     tool_calls=self.skill_tool_calls,
                     status=status,
                     final=clip(final or "", 500),
@@ -516,6 +519,8 @@ class MiniAgent:
     def activate_skill(self, skill, trigger, score):
         self.active_skill = skill
         self.skill_trigger = trigger
+        if skill.name not in self.skills_used:
+            self.skills_used.append(skill.name)
         self.remember(self.session["memory"]["notes"], f"skill {skill.name} activated ({trigger})", 5)
         log_event(
             self.skill_log_path(),
@@ -830,6 +835,7 @@ class MiniAgent:
         self.session["history"] = []
         self.session["memory"] = {"task": "", "files": [], "notes": []}
         self.active_skill = None
+        self.skill_trigger = None
         self.session_store.save(self.session)
 
     def path_is_within_root(self, resolved):

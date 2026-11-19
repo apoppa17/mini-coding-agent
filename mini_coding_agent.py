@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from skill_logger import log_event
+from skills import DEFAULT_THRESHOLD, discover_skills, similarity_check
 
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
@@ -236,6 +237,8 @@ class MiniAgent:
         depth=0,
         max_depth=1,
         read_only=False,
+        skill_dirs=(),
+        skill_threshold=DEFAULT_THRESHOLD,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -247,6 +250,12 @@ class MiniAgent:
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
+        self.skill_threshold = skill_threshold
+        self.skills = discover_skills(self.root, skill_dirs)
+        self.selected_skill = None
+        self.active_skill = None
+        self.skill_trigger = None
+        self.skill_tool_calls = []
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -319,6 +328,13 @@ class MiniAgent:
                 "run": self.tool_patch_file,
             },
         }
+        if self.skills:
+            tools["use_skill"] = {
+                "schema": {"name": "str"},
+                "risky": False,
+                "description": "Load and follow an agent skill by name (see Skills).",
+                "run": self.tool_use_skill,
+            }
         if self.depth < self.max_depth:
             tools["delegate"] = {
                 "schema": {"task": "str", "max_steps": "int=3"},
@@ -371,6 +387,8 @@ class MiniAgent:
             "Rules:\n" + rules,
             "Tools:\n" + tool_text,
             "Valid response examples:\n" + examples,
+            *(["Skills (call use_skill to load one when it fits the task):\n"
+               + "\n".join(f"- {s.name}: {s.description}" for s in self.skills)] if self.skills else []),
             self.workspace.text(),
         ])
 
@@ -424,6 +442,7 @@ class MiniAgent:
         return "\n\n".join([
             self.prefix,
             self.memory_text(),
+            *([self.skill_text()] if self.active_skill else []),
             "Transcript:\n" + self.history_text(),
             "Current user request:\n" + user_message,
         ])
@@ -454,8 +473,85 @@ class MiniAgent:
             self.session["id"],
             prompt=user_message,
         )
+        candidates, selected, reason = similarity_check(user_message, self.skills, self.skill_threshold)
+        self.selected_skill = next((s for s in self.skills if s.name == selected), None)
+        log_event(
+            self.root / ".mini-coding-agent" / "skill_events.jsonl",
+            "similarity_check",
+            self.session["id"],
+            prompt=user_message,
+            threshold=self.skill_threshold,
+            candidates=candidates,
+            selected=selected,
+            reason=reason,
+            depth=self.depth,
+        )
+        self.skill_tool_calls = []
+        if self.selected_skill:
+            best = candidates[0]
+            self.activate_skill(self.selected_skill, best["method"], best["score"])
+        status = "error"
+        final = None
+        try:
+            final, status = self.run_loop(user_message)
+            return final
+        finally:
+            if self.active_skill:
+                log_event(
+                    self.skill_log_path(),
+                    "skill_completed",
+                    self.session["id"],
+                    skill=self.active_skill.name,
+                    tool_calls=self.skill_tool_calls,
+                    status=status,
+                    final=clip(final or "", 500),
+                    depth=self.depth,
+                )
+            self.active_skill = None
+            self.skill_trigger = None
 
+    def skill_log_path(self):
+        return self.root / ".mini-coding-agent" / "skill_events.jsonl"
 
+    def activate_skill(self, skill, trigger, score):
+        self.active_skill = skill
+        self.skill_trigger = trigger
+        self.remember(self.session["memory"]["notes"], f"skill {skill.name} activated ({trigger})", 5)
+        log_event(
+            self.skill_log_path(),
+            "skill_executed",
+            self.session["id"],
+            skill=skill.name,
+            path=str(skill.path),
+            trigger=trigger,
+            score=score,
+            instructions_chars=len(self.skill_text()),
+            depth=self.depth,
+        )
+
+    def skill_text(self):
+        skill = self.active_skill
+        folder = skill.path.parent
+        extras = sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file() and p != skill.path)
+        lines = [
+            f"Active skill: {skill.name}",
+            f"Description: {skill.description}",
+            f"Source: {skill.path}",
+        ]
+        if extras:
+            lines.append("Supporting files: " + ", ".join(extras[:20]))
+        lines.append("Follow these skill instructions for this request:\n" + clip(skill.body, 6000))
+        return "\n".join(lines)
+
+    def tool_use_skill(self, args):
+        name = str(args.get("name", "")).strip()
+        skill = next(s for s in self.skills if s.name == name)
+        if not self.active_skill or self.active_skill.name != name:
+            self.activate_skill(skill, "tool", 1.0)
+        return clip(skill.body, 8000)
+
+    def run_loop(self, user_message):
+        memory = self.session["memory"]
         tool_steps = 0
         attempts = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
@@ -470,6 +566,8 @@ class MiniAgent:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 result = self.run_tool(name, args)
+                if self.active_skill or name == "use_skill":
+                    self.skill_tool_calls.append({"name": name, "ok": not str(result).startswith("error")})
                 self.record(
                     {
                         "role": "tool",
@@ -489,14 +587,14 @@ class MiniAgent:
             final = (payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
             self.remember(memory["notes"], clip(final, 220), 5)
-            return final
+            return final, "final"
 
         if attempts >= max_attempts and tool_steps < self.max_steps:
             final = "Stopped after too many malformed model responses without a valid tool call or final answer."
         else:
             final = "Stopped after reaching the step limit without a final answer."
         self.record({"role": "assistant", "content": final, "created_at": now()})
-        return final
+        return final, "stopped"
 
     #############################################################
     #### 3) Structured Tools, Validation, And Permissions #######
@@ -543,6 +641,12 @@ class MiniAgent:
 
     def validate_tool(self, name, args):
         args = args or {}
+
+        if name == "use_skill":
+            names = [s.name for s in self.skills]
+            if str(args.get("name", "")).strip() not in names:
+                raise ValueError("unknown skill; available: " + ", ".join(names))
+            return
 
         if name == "list_files":
             path = self.path(args.get("path", "."))
@@ -725,6 +829,7 @@ class MiniAgent:
     def reset(self):
         self.session["history"] = []
         self.session["memory"] = {"task": "", "files": [], "notes": []}
+        self.active_skill = None
         self.session_store.save(self.session)
 
     def path_is_within_root(self, resolved):
@@ -868,7 +973,9 @@ class MiniAgent:
             depth=self.depth + 1,
             max_depth=self.max_depth,
             read_only=True,
+            skill_threshold=self.skill_threshold,
         )
+        child.skills = self.skills
         child.session["memory"]["task"] = task
         child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
         return "delegate_result:\n" + child.ask(task)
@@ -939,6 +1046,7 @@ def build_agent(args):
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
+            skill_threshold=args.skill_threshold,
         )
     return MiniAgent(
         model_client=model,
@@ -947,6 +1055,7 @@ def build_agent(args):
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
+        skill_threshold=args.skill_threshold,
     )
 
 
@@ -967,6 +1076,7 @@ def build_arg_parser():
         default="ask",
         help="Approval policy for risky tools; auto grants the model arbitrary command execution and file writes.",
     )
+    parser.add_argument("--skill-threshold", type=float, default=DEFAULT_THRESHOLD, help="Minimum similarity score to select a skill.")
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool/model iterations per request.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")

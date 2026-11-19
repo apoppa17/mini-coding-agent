@@ -415,3 +415,108 @@ def test_prompt_logging(tmp_path):
     assert entry["prompt"] == "Test prompt logging"
     assert entry["session_id"] == agent.session["id"]
     assert "timestamp" in entry
+
+
+def write_skill(root, name, description, triggers=()):
+    folder = root / "skills" / name
+    folder.mkdir(parents=True)
+    trig = f"triggers: [{', '.join(triggers)}]\n" if triggers else ""
+    (folder / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n{trig}---\n\n# {name}\nDo the thing.\n", encoding="utf-8"
+    )
+
+
+def read_events(tmp_path):
+    path = tmp_path / ".mini-coding-agent" / "skill_events.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def make_skills(tmp_path):
+    write_skill(tmp_path, "pr-review", "Review a pull request diff for bugs and style issues.", ["pull request", "code review"])
+    write_skill(tmp_path, "vacuum-rl", "Solve the vacuum robot grid world with Q-learning.", ["vacuum robot", "q-learning"])
+
+
+@pytest.mark.parametrize(
+    "prompt, expected, method",
+    [
+        ("Please do a code review of my changes", "pr-review", "trigger_phrase"),
+        ("Train the vacuum robot agent", "vacuum-rl", "trigger_phrase"),
+        ("/skill vacuum-rl run it", "vacuum-rl", "explicit"),
+        ("review this diff for bugs", "pr-review", "cosine"),
+        ("what is the weather today", None, None),
+    ],
+)
+def test_similarity_check_logged(tmp_path, prompt, expected, method):
+    make_skills(tmp_path)
+    agent = build_agent(tmp_path, ["<final>ok</final>"])
+    agent.ask(prompt)
+    events = read_events(tmp_path)
+    expected_order = ["prompt_received", "similarity_check"]
+    if expected:
+        expected_order += ["skill_executed", "skill_completed"]
+    assert [e["event"] for e in events] == expected_order
+    check = events[1]
+    assert check["selected"] == expected
+    assert check["threshold"] == 0.25
+    assert len(check["candidates"]) == 2
+    assert check["candidates"][0]["score"] >= check["candidates"][1]["score"]
+    if method:
+        assert check["candidates"][0]["method"] == method
+
+
+def test_similarity_check_without_skills(tmp_path):
+    agent = build_agent(tmp_path, ["<final>ok</final>"])
+    agent.ask("hello")
+    check = read_events(tmp_path)[1]
+    assert check["selected"] is None and check["candidates"] == []
+
+
+def test_selected_skill_is_injected_and_logged(tmp_path):
+    make_skills(tmp_path)
+    agent = build_agent(tmp_path, ['<tool>{"name":"list_files","args":{"path":"."}}</tool>', "<final>done</final>"])
+    agent.ask("Train the vacuum robot agent")
+    prompts = agent.model_client.prompts
+    assert all("Active skill: vacuum-rl" in p and "Do the thing." in p for p in prompts)
+    assert prompts[0].index("Active skill") < prompts[0].index("Transcript:")
+    events = read_events(tmp_path)
+    executed, completed = events[2], events[3]
+    assert executed["skill"] == "vacuum-rl" and executed["trigger"] == "trigger_phrase" and executed["score"] == 0.9
+    assert executed["path"].endswith("SKILL.md") and executed["instructions_chars"] > 0
+    assert completed["status"] == "final" and completed["final"] == "done"
+    assert completed["tool_calls"] == [{"name": "list_files", "ok": True}]
+    assert agent.active_skill is None
+    agent.model_client.outputs.append("<final>x</final>")
+    agent.ask("what is the weather")
+    assert "Active skill" not in agent.model_client.prompts[-1]
+
+
+def test_model_can_call_use_skill(tmp_path):
+    make_skills(tmp_path)
+    agent = build_agent(tmp_path, ['<tool>{"name":"use_skill","args":{"name":"pr-review"}}</tool>', "<final>ok</final>"])
+    assert "use_skill" in agent.tools and "- pr-review:" in agent.prefix
+    agent.ask("hello there")
+    assert "Active skill: pr-review" in agent.model_client.prompts[1]
+    events = read_events(tmp_path)
+    assert [e["event"] for e in events] == ["prompt_received", "similarity_check", "skill_executed", "skill_completed"]
+    assert events[2]["trigger"] == "tool"
+
+
+def test_use_skill_unknown_name(tmp_path):
+    make_skills(tmp_path)
+    agent = build_agent(tmp_path, [])
+    result = agent.run_tool("use_skill", {"name": "nope"})
+    assert result.startswith("error") and "vacuum-rl" in result
+
+
+def test_no_use_skill_tool_without_skills(tmp_path):
+    agent = build_agent(tmp_path, [])
+    assert "use_skill" not in agent.tools and "Skills" not in agent.prefix
+
+
+def test_skill_cleared_on_crash(tmp_path):
+    make_skills(tmp_path)
+    agent = build_agent(tmp_path, [])
+    with pytest.raises(Exception):
+        agent.ask("Train the vacuum robot agent")
+    assert agent.active_skill is None
+    assert read_events(tmp_path)[-1]["status"] == "error"

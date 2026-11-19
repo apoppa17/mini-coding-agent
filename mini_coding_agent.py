@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from skill_logger import log_event
-from skills import DEFAULT_THRESHOLD, discover_skills, similarity_check
+from skills import DEFAULT_THRESHOLD, SKILL_DIRS, discover_skills, similarity_check
 
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
@@ -251,7 +251,8 @@ class MiniAgent:
         self.max_depth = max_depth
         self.read_only = read_only
         self.skill_threshold = skill_threshold
-        self.skills = discover_skills(self.root, skill_dirs)
+        cwd_skill_dirs = [Path(workspace.cwd) / d for d in SKILL_DIRS] if Path(workspace.cwd).resolve() != self.root.resolve() else []
+        self.skills = discover_skills(self.root, [*cwd_skill_dirs, *skill_dirs])
         self.selected_skill = None
         self.active_skill = None
         self.skill_trigger = None
